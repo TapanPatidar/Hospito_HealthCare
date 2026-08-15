@@ -1,0 +1,6 @@
+{
+  "name": "Hospito - Healthcare Interoperability Platform",
+  "description": "A secure digital health system connecting Patients, Doctors, and Pharmacists with electronic prescriptions, real-time pharmacy alerts, and bilingual AI health guidance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

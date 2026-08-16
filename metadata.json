@@ -1,6 +1,6 @@
 {
-  "name": "Hospito - Healthcare Interoperability Platform",
-  "description": "A secure digital health system connecting Patients, Doctors, and Pharmacists with electronic prescriptions, real-time pharmacy alerts, and bilingual AI health guidance.",
+  "name": "CloudSaaS - MongoDB Atlas Platform",
+  "description": "Full-stack SaaS web application connected to MongoDB Atlas with live user persistence, subscription management, Mongoose validation schemas, seed script, and real-time database explorer.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

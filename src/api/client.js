@@ -1,162 +1,102 @@
-const API_BASE = '/api';
+// API Client for SaaS Backend & MongoDB Atlas Operations
 
 export const api = {
-  // Auth
-  login: async (email, password) => {
-    const res = await fetch(`${API_BASE}/auth/login`, {
+  // 1. Diagnostics & Health
+  async getDbStatus() {
+    const res = await fetch('/api/db-status');
+    if (!res.ok) throw new Error('Failed to fetch DB diagnostics');
+    return res.json();
+  },
+
+  async getStats() {
+    const res = await fetch('/api/stats');
+    if (!res.ok) throw new Error('Failed to fetch stats');
+    return res.json();
+  },
+
+  // 2. Users (Atlas 'users' collection)
+  async getUsers(params = {}) {
+    const query = new URLSearchParams(params).toString();
+    const res = await fetch(`/api/users?${query}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to fetch users');
+    }
+    return res.json();
+  },
+
+  async signup(userData) {
+    const res = await fetch('/api/signup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify(userData),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Login failed');
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to sign up user');
+    }
     return data;
   },
 
-  register: async (payload) => {
-    const res = await fetch(`${API_BASE}/auth/register`, {
+  async deleteUser(userId) {
+    const res = await fetch(`/api/users/${userId}`, {
+      method: 'DELETE',
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to delete user');
+    }
+    return data;
+  },
+
+  // 3. Subscriptions (Atlas 'subscriptions' collection)
+  async getSubscriptions(params = {}) {
+    const query = new URLSearchParams(params).toString();
+    const res = await fetch(`/api/subscriptions?${query}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to fetch subscriptions');
+    }
+    return res.json();
+  },
+
+  async createSubscription(subData) {
+    const res = await fetch('/api/subscriptions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(subData),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Registration failed');
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to create subscription');
+    }
     return data;
   },
 
-  // Patients
-  getPatients: async (search) => {
-    const params = new URLSearchParams();
-    if (search) params.append('q', search);
-    const res = await fetch(`${API_BASE}/patients?${params.toString()}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to fetch patients');
-    return data;
-  },
-
-  getPatientDetail: async (id) => {
-    const res = await fetch(`${API_BASE}/patients/${id}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to fetch patient detail');
-    return data;
-  },
-
-  // Pharmacies
-  getPharmacies: async () => {
-    const res = await fetch(`${API_BASE}/pharmacies`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to fetch pharmacies');
-    return data;
-  },
-
-  // Prescriptions
-  getPrescriptions: async (filters = {}) => {
-    const params = new URLSearchParams();
-    Object.entries(filters).forEach(([key, val]) => {
-      if (val) params.append(key, val);
-    });
-    const res = await fetch(`${API_BASE}/prescriptions?${params.toString()}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to fetch prescriptions');
-    return data;
-  },
-
-  createPrescription: async (payload) => {
-    const res = await fetch(`${API_BASE}/prescriptions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to create prescription');
-    return data;
-  },
-
-  updatePrescriptionStatus: async (id, status) => {
-    const res = await fetch(`${API_BASE}/prescriptions/${id}/status`, {
+  async updateSubscription(subId, updateData) {
+    const res = await fetch(`/api/subscriptions/${subId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status }),
+      body: JSON.stringify(updateData),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to update prescription status');
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to update subscription');
+    }
     return data;
   },
 
-  // Alerts
-  getAlerts: async (pharmacyId) => {
-    const params = new URLSearchParams();
-    if (pharmacyId) params.append('pharmacyId', pharmacyId);
-    const res = await fetch(`${API_BASE}/alerts?${params.toString()}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to fetch alerts');
-    return data;
-  },
-
-  markAlertsRead: async (pharmacyId) => {
-    await fetch(`${API_BASE}/alerts/mark-read`, {
+  // 4. Seed Trigger
+  async triggerSeed(force = false) {
+    const res = await fetch('/api/seed', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pharmacyId }),
-    });
-  },
-
-  // Stats
-  getDoctorStats: async (doctorId) => {
-    const res = await fetch(`${API_BASE}/stats/doctor/${doctorId}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to fetch doctor stats');
-    return data;
-  },
-
-  getPharmacistStats: async (pharmacyId) => {
-    const res = await fetch(`${API_BASE}/stats/pharmacist/${pharmacyId}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to fetch pharmacist stats');
-    return data;
-  },
-
-  // Database status & Live Inspection
-  getDbStatus: async () => {
-    const res = await fetch(`${API_BASE}/db/status`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to fetch DB status');
-    return data;
-  },
-
-  inspectDb: async () => {
-    const res = await fetch(`${API_BASE}/db/inspect`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to inspect MongoDB collections');
-    return data;
-  },
-
-  connectCustomDb: async (uri) => {
-    const res = await fetch(`${API_BASE}/db/connect`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ uri }),
+      body: JSON.stringify({ force }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || data.message || 'Connection failed');
-    return data;
-  },
-
-  resetDemoData: async () => {
-    const res = await fetch(`${API_BASE}/seed/reset`, { method: 'POST' });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to reset demo data');
-  },
-
-  // AI Bilingual Assistant
-  chat: async (payload) => {
-    const res = await fetch(`${API_BASE}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to get chat response');
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to trigger seed');
+    }
     return data;
   },
 };

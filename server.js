@@ -2,491 +2,385 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import dotenv from 'dotenv';
+import mongoose from 'mongoose';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI } from '@google/genai';
-import { dbService, verifyPassword, hashPassword } from './server/db.js';
+import { User, Subscription, connectDB, hashPassword, getDBDiagnostics } from './server/models.js';
+import { runSeed } from './seed.js';
 
 dotenv.config();
 
-// Lazy Gemini API Client
-let geminiClient = null;
-function getGeminiClient() {
-  if (!geminiClient && process.env.GEMINI_API_KEY) {
-    geminiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-  }
-  return geminiClient;
-}
+const PORT = 3000;
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
 
   // Middleware
   app.use(cors());
   app.use(express.json());
 
-  // --- API ROUTES ---
+  // Connect to MongoDB Atlas
+  console.log('🔄 Initializing MongoDB Atlas connection...');
+  await connectDB();
 
-  // Health check & DB Status
+  // Auto-connect middleware for API routes
+  app.use('/api', async (req, res, next) => {
+    if (mongoose.connection.readyState !== 1 && process.env.MONGODB_URI) {
+      await connectDB();
+    }
+    next();
+  });
+
+  // ----------------------------------------------------
+  // API ROUTES
+  // ----------------------------------------------------
+
+  // 1. Health & Database Status Diagnostics
   app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({
+      status: 'ok',
+      service: 'SaaS Platform API',
+      timestamp: new Date().toISOString(),
+    });
   });
 
   app.get('/api/db-status', async (req, res) => {
     try {
-      const status = await dbService.getStatus();
-      res.json(status);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
+      const diagnostics = await getDBDiagnostics();
+      res.json(diagnostics);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
     }
   });
 
-  app.get('/api/db/status', async (req, res) => {
+  // 2. POST /api/signup - Persists new user to Atlas 'users' collection
+  app.post('/api/signup', async (req, res) => {
     try {
-      const status = await dbService.getStatus();
-      res.json(status);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+      const { name, email, password, plan = 'starter' } = req.body;
 
-  app.get('/api/db/inspect', async (req, res) => {
-    try {
-      const data = await dbService.inspectCollections();
-      res.json(data);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  app.post('/api/db/connect', async (req, res) => {
-    try {
-      const { uri } = req.body;
-      if (!uri) {
-        return res.status(400).json({ success: false, error: 'Connection URI is required' });
-      }
-      const result = await dbService.connectCustomUri(uri);
-      res.json(result);
-    } catch (err) {
-      res.status(400).json({ success: false, error: err.message });
-    }
-  });
-
-  // Auth - Register
-  app.post('/api/auth/register', async (req, res) => {
-    try {
-      const { email, password, name, role, dateOfBirth, bloodType, specialization, licenseNumber, pharmacyName } = req.body;
-
-      if (!email || !password || !name || !role) {
-        return res.status(400).json({ error: 'Please provide all required fields' });
+      // Basic input validation
+      if (!name || typeof name !== 'string' || name.trim().length < 2) {
+        return res.status(400).json({ error: 'Name is required (minimum 2 characters)' });
       }
 
-      // Check if account with email already exists
-      const existing = await dbService.findUserByEmail(email);
+      if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+        return res.status(400).json({ error: 'A valid email address is required' });
+      }
+
+      if (!password || password.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+      }
+
+      const normalizedEmail = email.toLowerCase().trim();
+
+      // Check if user already exists
+      const existing = await User.findOne({ email: normalizedEmail });
       if (existing) {
-        return res.status(409).json({ error: 'An account with this email already exists' });
+        return res.status(409).json({ error: `User with email ${normalizedEmail} already exists in Atlas` });
       }
 
-      const passwordHash = hashPassword(password);
-      const user = await dbService.createUser({
-        name,
-        email,
+      // Hash password
+      const passwordHash = await hashPassword(password);
+
+      // Insert User document into Atlas
+      const newUser = await User.create({
+        name: name.trim(),
+        email: normalizedEmail,
         passwordHash,
-        role,
-        dateOfBirth: role === 'patient' ? dateOfBirth : undefined,
-        bloodType: role === 'patient' ? bloodType : undefined,
-        specialization: role === 'doctor' ? specialization : undefined,
-        licenseNumber: (role === 'doctor' || role === 'pharmacist') ? licenseNumber : undefined,
-        pharmacyName: role === 'pharmacist' ? pharmacyName : undefined,
-        medicalHistory: role === 'patient' ? [] : undefined,
-        allergies: role === 'patient' ? [] : undefined,
+        plan: ['starter', 'professional', 'enterprise', 'free'].includes(plan.toLowerCase()) ? plan.toLowerCase() : 'starter',
+        createdAt: new Date(),
       });
 
-      // Remove password hash from response
-      const { passwordHash: _, ...safeUser } = user;
+      // Auto-provision initial subscription record in Atlas 'subscriptions' collection
+      const planPrices = {
+        free: 0,
+        starter: 29,
+        professional: 79,
+        enterprise: 249,
+      };
+
+      const planDisplayNames = {
+        free: 'Starter',
+        starter: 'Starter',
+        professional: 'Professional',
+        enterprise: 'Enterprise',
+      };
+
+      const renewalDate = new Date();
+      renewalDate.setMonth(renewalDate.getMonth() + 1);
+
+      const newSub = await Subscription.create({
+        userId: newUser._id,
+        planName: planDisplayNames[newUser.plan] || 'Starter',
+        status: 'active',
+        startDate: new Date(),
+        renewalDate: renewalDate,
+        amount: planPrices[newUser.plan] ?? 29,
+      });
+
+      // Return sanitized user (WITHOUT passwordHash)
       res.status(201).json({
-        user: safeUser,
-        token: `hospito_token_${user.id}_${Date.now()}`
+        message: 'User successfully created and stored in MongoDB Atlas',
+        targetDatabase: newUser.db?.name || 'saas_db',
+        targetCollection: 'users',
+        user: {
+          _id: newUser._id,
+          name: newUser.name,
+          email: newUser.email,
+          plan: newUser.plan,
+          createdAt: newUser.createdAt,
+        },
+        subscription: {
+          _id: newSub._id,
+          planName: newSub.planName,
+          status: newSub.status,
+          amount: newSub.amount,
+          renewalDate: newSub.renewalDate,
+        },
       });
-    } catch (err) {
-      console.error('Registration error:', err);
-      res.status(500).json({ error: 'Internal server error during registration' });
+    } catch (error) {
+      console.error('Signup error:', error);
+      if (error.code === 11000) {
+        return res.status(409).json({ error: 'Email address already exists in Atlas' });
+      }
+      res.status(400).json({ error: error.message || 'Failed to create user in Atlas' });
     }
   });
 
-  // Auth - Login
-  app.post('/api/auth/login', async (req, res) => {
+  // 3. POST /api/subscriptions - Creates a subscription document linked to a user in Atlas
+  app.post('/api/subscriptions', async (req, res) => {
     try {
-      const { email, password } = req.body;
+      const { userId, planName, status = 'active', amount, renewalDate } = req.body;
 
-      if (!email || !password) {
-        return res.status(400).json({ error: 'Email and password are required' });
-      }
-
-      const user = await dbService.findUserByEmail(email);
-      if (!user) {
-        return res.status(401).json({ error: 'Invalid email or password' });
-      }
-
-      const isValid = verifyPassword(password, user.passwordHash);
-      if (!isValid) {
-        return res.status(401).json({ error: 'Invalid email or password' });
-      }
-
-      const { passwordHash: _, ...safeUser } = user;
-      res.json({
-        user: safeUser,
-        token: `hospito_token_${user.id}_${Date.now()}`
-      });
-    } catch (err) {
-      console.error('Login error:', err);
-      res.status(500).json({ error: 'Internal server error during login' });
-    }
-  });
-
-  // Auth - Me
-  app.get('/api/auth/me', async (req, res) => {
-    try {
-      const userId = req.headers['x-user-id'];
       if (!userId) {
-        return res.status(401).json({ error: 'Unauthorized' });
+        return res.status(400).json({ error: 'userId is required to link subscription' });
       }
-      const user = await dbService.findUserById(userId);
+
+      // Verify user exists in Atlas
+      const user = await User.findById(userId);
       if (!user) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-      const { passwordHash: _, ...safeUser } = user;
-      res.json({ user: safeUser });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Patients list (for Doctor Dashboard search)
-  app.get('/api/patients', async (req, res) => {
-    try {
-      const query = req.query.q || req.query.search || '';
-      const patients = await dbService.getPatients(query);
-      const safePatients = patients.map(({ passwordHash, ...rest }) => rest);
-      res.json({
-        patients: safePatients,
-        total: safePatients.length
-      });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Patient detail
-  app.get('/api/patients/:id', async (req, res) => {
-    try {
-      const patient = await dbService.findUserById(req.params.id);
-      if (!patient || patient.role !== 'patient') {
-        return res.status(404).json({ error: 'Patient not found' });
-      }
-      const prescriptions = await dbService.getPrescriptions({ patientId: patient.id });
-      const { passwordHash, ...safePatient } = patient;
-      res.json({
-        patient: safePatient,
-        prescriptions
-      });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Pharmacies list (for Doctor prescription form dropdown)
-  app.get('/api/pharmacies', async (req, res) => {
-    try {
-      const pharmacies = await dbService.getPharmacies();
-      const safePharmacies = pharmacies.map(({ passwordHash, ...rest }) => rest);
-      res.json({ pharmacies: safePharmacies });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Prescriptions - Get (filtered by patient, doctor, or pharmacy)
-  app.get('/api/prescriptions', async (req, res) => {
-    try {
-      const { role, userId, patientId, pharmacyId, doctorId } = req.query;
-      const filter = {};
-      if (patientId) filter.patientId = patientId;
-      if (pharmacyId) filter.pharmacyId = pharmacyId;
-      if (doctorId) filter.doctorId = doctorId;
-
-      if (!patientId && !pharmacyId && !doctorId && userId && role) {
-        if (role === 'patient') filter.patientId = userId;
-        if (role === 'doctor') filter.doctorId = userId;
-        if (role === 'pharmacist') filter.pharmacyId = userId;
+        return res.status(404).json({ error: 'Target user not found in Atlas database' });
       }
 
-      const prescriptions = await dbService.getPrescriptions(filter);
-      res.json({
-        prescriptions,
-        total: prescriptions.length
-      });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Prescriptions - Create (Doctor writes prescription)
-  app.post('/api/prescriptions', async (req, res) => {
-    try {
-      const {
-        patientId,
-        patientName,
-        patientEmail,
-        patientDob,
-        patientBloodType,
-        doctorId,
-        doctorName,
-        doctorLicense,
-        pharmacyId,
-        pharmacyName,
-        medication,
-        dosage,
-        frequency,
-        duration,
-        diagnosis,
-        notes
-      } = req.body;
-
-      if (!patientId || !doctorId || !pharmacyId || !medication || !dosage || !frequency || !duration) {
-        return res.status(400).json({ error: 'Missing required prescription fields' });
+      if (!planName) {
+        return res.status(400).json({ error: 'planName is required (Starter, Professional, Enterprise, Custom)' });
       }
 
-      const newRx = await dbService.createPrescription({
-        patientId,
-        patientName: patientName || 'Patient',
-        patientEmail: patientEmail || '',
-        patientDob,
-        patientBloodType,
-        doctorId,
-        doctorName: doctorName || 'Dr.',
-        doctorLicense,
-        pharmacyId,
-        pharmacyName: pharmacyName || 'Pharmacy',
-        medication,
-        dosage,
-        frequency,
-        duration,
-        diagnosis: diagnosis || 'General checkup',
-        notes: notes || '',
-        status: 'pending'
+      const defaultPrices = {
+        Starter: 29,
+        Professional: 79,
+        Enterprise: 249,
+        Custom: 499,
+      };
+
+      const finalAmount = amount !== undefined ? Number(amount) : defaultPrices[planName] || 29;
+
+      const finalRenewalDate = renewalDate
+        ? new Date(renewalDate)
+        : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+      const subscription = await Subscription.create({
+        userId: user._id,
+        planName,
+        status: ['active', 'trialing', 'canceled'].includes(status) ? status : 'active',
+        startDate: new Date(),
+        renewalDate: finalRenewalDate,
+        amount: finalAmount,
       });
+
+      // Also update user's plan field if upgraded
+      if (['Starter', 'Professional', 'Enterprise'].includes(planName)) {
+        user.plan = planName.toLowerCase();
+        await user.save();
+      }
+
+      const populatedSub = await Subscription.findById(subscription._id).populate('userId', 'name email plan');
 
       res.status(201).json({
-        prescription: newRx,
-        message: 'Prescription sent to pharmacy successfully!'
+        message: 'Subscription created and saved to MongoDB Atlas',
+        targetCollection: 'subscriptions',
+        subscription: populatedSub,
       });
-    } catch (err) {
-      console.error('Error creating prescription:', err);
-      res.status(500).json({ error: 'Failed to create prescription' });
+    } catch (error) {
+      console.error('Create subscription error:', error);
+      res.status(400).json({ error: error.message || 'Failed to create subscription in Atlas' });
     }
   });
 
-  // Prescriptions - Update status (Pharmacist fulfills / rejects)
-  app.patch('/api/prescriptions/:id/status', async (req, res) => {
+  // 4. GET /api/users - List all users from Atlas (no passwords)
+  app.get('/api/users', async (req, res) => {
+    try {
+      const { search, plan, limit = 50, page = 1 } = req.query;
+
+      const query = {};
+      if (search) {
+        query.$or = [
+          { name: { $regex: search, $options: 'i' } },
+          { email: { $regex: search, $options: 'i' } },
+        ];
+      }
+      if (plan && plan !== 'all') {
+        query.plan = plan.toLowerCase();
+      }
+
+      const skip = (Math.max(1, parseInt(page, 10)) - 1) * parseInt(limit, 10);
+      const total = await User.countDocuments(query);
+      const users = await User.find(query, '-passwordHash')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit, 10));
+
+      // Get subscription counts for each user
+      const userIds = users.map((u) => u._id);
+      const subscriptions = await Subscription.find({ userId: { $in: userIds } });
+
+      const enrichedUsers = users.map((u) => {
+        const userSubs = subscriptions.filter((s) => s.userId.toString() === u._id.toString());
+        const activeSub = userSubs.find((s) => s.status === 'active') || userSubs[0];
+        return {
+          ...u.toObject(),
+          activeSubscription: activeSub || null,
+          subscriptionCount: userSubs.length,
+        };
+      });
+
+      res.json({
+        total,
+        page: parseInt(page, 10),
+        limit: parseInt(limit, 10),
+        database: User.db?.name || 'saas_db',
+        collection: 'users',
+        users: enrichedUsers,
+      });
+    } catch (error) {
+      console.error('Fetch users error:', error);
+      res.status(500).json({ error: error.message || 'Failed to retrieve users from Atlas' });
+    }
+  });
+
+  // 5. GET /api/subscriptions - List all subscriptions from Atlas with populated user info
+  app.get('/api/subscriptions', async (req, res) => {
+    try {
+      const { status, limit = 50 } = req.query;
+      const query = {};
+      if (status && status !== 'all') {
+        query.status = status;
+      }
+
+      const subscriptions = await Subscription.find(query)
+        .populate('userId', 'name email plan createdAt')
+        .sort({ createdAt: -1 })
+        .limit(parseInt(limit, 10));
+
+      res.json({
+        total: subscriptions.length,
+        database: Subscription.db?.name || 'saas_db',
+        collection: 'subscriptions',
+        subscriptions,
+      });
+    } catch (error) {
+      console.error('Fetch subscriptions error:', error);
+      res.status(500).json({ error: error.message || 'Failed to retrieve subscriptions from Atlas' });
+    }
+  });
+
+  // 6. GET /api/stats - Live summary metrics directly from Atlas collections
+  app.get('/api/stats', async (req, res) => {
+    try {
+      const totalUsers = await User.countDocuments();
+      const activeSubs = await Subscription.countDocuments({ status: 'active' });
+      const trialingSubs = await Subscription.countDocuments({ status: 'trialing' });
+      const canceledSubs = await Subscription.countDocuments({ status: 'canceled' });
+
+      // Calculate MRR
+      const activeSubDocs = await Subscription.find({ status: 'active' });
+      const mrr = activeSubDocs.reduce((sum, s) => sum + (s.amount || 0), 0);
+
+      // Plan breakdown
+      const starterUsers = await User.countDocuments({ plan: 'starter' });
+      const proUsers = await User.countDocuments({ plan: 'professional' });
+      const enterpriseUsers = await User.countDocuments({ plan: 'enterprise' });
+
+      res.json({
+        totalUsers,
+        activeSubscriptions: activeSubs,
+        trialingSubscriptions: trialingSubs,
+        canceledSubscriptions: canceledSubs,
+        mrr,
+        planBreakdown: {
+          starter: starterUsers,
+          professional: proUsers,
+          enterprise: enterpriseUsers,
+        },
+        databaseName: User.db?.name || 'saas_db',
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error('Stats error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // 7. POST /api/seed - Trigger or re-run seed process
+  app.post('/api/seed', async (req, res) => {
+    try {
+      const { force = false } = req.body || {};
+      const result = await runSeed(force);
+      res.json(result);
+    } catch (error) {
+      console.error('Seed API error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // 8. DELETE /api/users/:id - Delete test user & associated subscriptions
+  app.delete('/api/users/:id', async (req, res) => {
     try {
       const { id } = req.params;
-      const { status } = req.body;
-
-      if (!status || !['fulfilled', 'rejected'].includes(status)) {
-        return res.status(400).json({ error: 'Invalid status. Must be fulfilled or rejected' });
+      const user = await User.findByIdAndDelete(id);
+      if (!user) {
+        return res.status(404).json({ error: 'User document not found in Atlas' });
       }
 
-      const updated = await dbService.updatePrescriptionStatus(id, status);
-      if (!updated) {
-        return res.status(404).json({ error: 'Prescription not found' });
-      }
+      await Subscription.deleteMany({ userId: id });
 
-      res.json({ prescription: updated });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
+      res.json({
+        message: `User ${user.email} and related subscriptions deleted from Atlas`,
+        deletedUserId: id,
+      });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
     }
   });
 
-  // Alerts - Get (Pharmacist Live Alerts)
-  app.get('/api/alerts', async (req, res) => {
+  // 9. PATCH /api/subscriptions/:id - Update subscription status
+  app.patch('/api/subscriptions/:id', async (req, res) => {
     try {
-      const pharmacyId = req.query.pharmacyId;
-      const alerts = await dbService.getAlerts(pharmacyId);
-      res.json({ alerts, total: alerts.length });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+      const { id } = req.params;
+      const { status, planName, amount } = req.body;
 
-  // Alerts - Mark all read
-  app.post('/api/alerts/mark-read', async (req, res) => {
-    try {
-      const { pharmacyId } = req.body;
-      if (pharmacyId) {
-        await dbService.markAlertsAsRead(pharmacyId);
-      }
-      res.json({ success: true });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+      const updateData = {};
+      if (status) updateData.status = status;
+      if (planName) updateData.planName = planName;
+      if (amount !== undefined) updateData.amount = Number(amount);
 
-  // Doctor Stats
-  app.get('/api/stats/doctor/:doctorId', async (req, res) => {
-    try {
-      const stats = await dbService.getDoctorStats(req.params.doctorId);
-      res.json(stats);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+      const sub = await Subscription.findByIdAndUpdate(id, updateData, { new: true }).populate('userId', 'name email plan');
 
-  // Pharmacist Stats
-  app.get('/api/stats/pharmacist/:pharmacyId', async (req, res) => {
-    try {
-      const stats = await dbService.getPharmacistStats(req.params.pharmacyId);
-      res.json(stats);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Reset Demo Data
-  app.post('/api/seed/reset', async (req, res) => {
-    try {
-      await dbService.resetDemoData();
-      res.json({ message: 'Demo data reset successfully!' });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // AI Patient & Platform Bilingual Chatbot (/api/chat)
-  app.post('/api/chat', async (req, res) => {
-    try {
-      const { message, language = 'en', userRole = 'patient', userName = 'Patient' } = req.body;
-
-      if (!message || typeof message !== 'string') {
-        return res.status(400).json({ error: 'Message is required' });
-      }
-
-      const isHindi = language === 'hi' || /[\u0900-\u097F]/.test(message);
-
-      // System Prompt for Hospito Healthcare AI Assistant
-      const systemPrompt = `You are "Hospito AI Health & App Assistant" (हॉस्पिटो स्वास्थ्य एवं ऐप सहायक), an intelligent, compassionate, and helpful medical & platform assistant for the Hospito Healthcare Interoperability system.
-
-Current User Context:
-- Role: ${userRole}
-- Name: ${userName}
-- Preferred Language: ${isHindi ? 'Hindi (हिंदी)' : 'English'}
-
-Your core duties:
-1. Explain how to use the Hospito application simply and clearly:
-   - For Patients: How to see active prescriptions, how doctors write them, how to copy their Patient ID (${userName}'s ID) to give to their doctor, and how to track if their pharmacy has fulfilled their medicine.
-   - For Doctors: How to search patients by ID/Name, write digital prescriptions with diagnosis, dosage, and frequency, select pharmacy, and dispatch instant alerts.
-   - For Pharmacists: How incoming orders arrive in real-time in the queue, how to review dosage/notes, and click "Fulfill" or "Reject".
-2. Answer basic healthcare & medication questions:
-   - Provide clear, simple explanations for common conditions and medicines (e.g. Paracetamol, Metformin, Amoxicillin, Cetirizine, Omeprazole, BP, Fever, Cold).
-   - Explain common terms like "twice daily after meals", "empty stomach", hydration, and proper storage.
-   - ALWAYS include a brief, caring medical safety reminder to follow the exact prescription given by the consulting doctor.
-3. Language Behavior:
-   - If language is Hindi (or user writes in Hindi/Hinglish), answer in clean, polite, easy-to-understand Hindi (देवनागरी / शुद्ध एवं सरल हिंदी).
-   - If language is English, answer in clear, polite English.
-   - Format responses with clean bullet points and bold highlights for easy readability. Keep answers focused and friendly (around 2-4 short paragraphs or bullet points).`;
-
-      const ai = getGeminiClient();
-
-      if (ai) {
-        try {
-          const response = await ai.models.generateContent({
-            model: 'gemini-3.7-flash',
-            contents: [
-              {
-                role: 'user',
-                parts: [{ text: `${systemPrompt}\n\nUser Question:\n${message}` }]
-              }
-            ],
-          });
-
-          const replyText = response.text || (isHindi ? 'नमस्ते! मैं आपकी किस प्रकार सहायता कर सकता हूँ?' : 'Hello! How can I help you today?');
-          return res.json({
-            reply: replyText,
-            language: isHindi ? 'hi' : 'en',
-            source: 'gemini-3.7-flash'
-          });
-        } catch (genError) {
-          console.warn('Gemini API call failed, using intelligent built-in medical KB fallback:', genError?.message);
-        }
-      }
-
-      // Intelligent Built-in Fallback Knowledge Base (Hindi & English)
-      const q = message.toLowerCase();
-      let fallbackReply = '';
-
-      if (isHindi) {
-        if (q.includes('उपयोग') || q.includes('use') || q.includes('kaise') || q.includes('kese') || q.includes('चलाएं') || q.includes('काम')) {
-          fallbackReply = `🏥 **Hospito का उपयोग कैसे करें:**\n\n` +
-            `1. **मरीज़ (Patient):** आप अपने डैशबोर्ड पर सभी एक्टिव दवाएं (Prescriptions) देख सकते हैं। अपना **Patient ID** कॉपी करके अपने डॉक्टर को दें ताकि वे सीधे आपके खाते में पर्ची भेज सकें।\n` +
-            `2. **दवा कब मिलेगी (Pharmacy Tracking):** जब डॉक्टर पर्ची भेजते हैं, यह तुरंत आपकी चुनी हुई फार्मेसी को चली जाती है। जब फार्मासिस्ट दवा तैयार कर देगा, स्थिति **"Fulfilled" (तैयार)** हो जाएगी।\n` +
-            `3. **डॉक्टर और फार्मासिस्ट:** डॉक्टर सीधे मरीज़ की आईडी से पर्ची लिखते हैं और फार्मासिस्ट को लाइव अलर्ट मिलता है।\n\n` +
-            `💡 *क्या आप किसी खास दवा या बीमारी के बारे में जानना चाहते हैं?*`;
-        } else if (q.includes('दवा') || q.includes('medicine') || q.includes('dawa') || q.includes('paracetamol') || q.includes('metformin') || q.includes('बुखार') || q.includes('दर्द')) {
-          fallbackReply = `💊 **दवाइयों से जुड़ी महत्वपूर्ण जानकारी:**\n\n` +
-            `• **पेरासिटामोल (Paracetamol):** सामान्य बुखार और सिरदर्द/शरीर दर्द में आराम के लिए डॉक्टर द्वारा दी जाती है। इसे खाने के बाद पानी के साथ लें।\n` +
-            `• **मेटफॉर्मिन (Metformin):** टाइप 2 डायबिटीज में ब्लड शुगर नियंत्रित करने हेतु उपयोग होती है, इसे आमतौर पर भोजन के साथ लिया जाता है।\n` +
-            `• **एंटीबायोटिक (जैसे Amoxicillin):** डॉक्टर द्वारा बताए गए पूरे दिन (Course) तक लेना जरूरी है।\n\n` +
-            `⚠️ **सलाह:** कृपया कोई भी दवा अपने डॉक्टर द्वारा लिखी गई खुराक और समय के अनुसार ही लें। आपातकालीन स्थिति में तुरंत नजदीकी अस्पताल संपर्क करें।`;
-        } else if (q.includes('नमस्ते') || q.includes('hello') || q.includes('hi') || q.includes('hey') || q.includes('मदद')) {
-          fallbackReply = `नमस्ते ${userName}! 🙏 मैं **Hospito AI स्वास्थ्य सहायक** हूँ।\n\nमैं आपकी इन चीज़ों में मदद कर सकता हूँ:\n` +
-            `• Hospito पोर्टल का उपयोग कैसे करें (पर्ची देखना, ID शेयर करना)\n` +
-            `• आपकी दवाइयों और खुराक से जुड़े सामान्य सवाल\n` +
-            `• फार्मेसी और डॉक्टर से जुड़े अपडेट\n\nआप मुझसे हिंदी या अंग्रेज़ी में कुछ भी पूछ सकते हैं!`;
-        } else {
-          fallbackReply = `आपके प्रश्न के लिए धन्यवाद! 🌿\n\n` +
-            `• **Hospito ऐप से संबंधित:** आप अपने डैशबोर्ड पर अपनी पर्ची (Prescription), बीमारी का विवरण (Diagnosis), और फार्मेसी स्टेटस देख सकते हैं।\n` +
-            `• **दवाइयों के नियम:** दवाएं हमेशा सही समय पर, पर्याप्त पानी के साथ और डॉक्टर के परामर्श अनुसार लें।\n\n` +
-            `यदि आपका कोई विशेष प्रश्न है, तो कृपया विस्तार से लिखें। मैं आपकी सहायता के लिए तैयार हूँ!`;
-        }
-      } else {
-        if (q.includes('use') || q.includes('how to') || q.includes('work') || q.includes('guide') || q.includes('patient id')) {
-          fallbackReply = `🏥 **How to use the Hospito Platform:**\n\n` +
-            `1. **View Active Prescriptions:** Your dashboard displays all active medication orders, dosage instructions, and doctor diagnosis in real-time.\n` +
-            `2. **Share Your Patient ID:** Click the **"Copy ID"** button next to your Patient ID on the top banner and provide it to your doctor during consultations.\n` +
-            `3. **Track Pharmacy Fulfillment:** As soon as your doctor writes a digital prescription, it alerts your selected pharmacy. The status changes from **Pending (Amber)** to **Fulfilled (Cyan/Green)** once ready.\n` +
-            `4. **Download & Print:** You can export your prescriptions as clinical JSON or printable records anytime.`;
-        } else if (q.includes('medicine') || q.includes('prescription') || q.includes('metformin') || q.includes('paracetamol') || q.includes('dosage') || q.includes('pill')) {
-          fallbackReply = `💊 **Medication & Healthcare Guidance:**\n\n` +
-            `• **Metformin:** Commonly prescribed for Type 2 Diabetes management. Usually taken with meals to reduce stomach discomfort.\n` +
-            `• **Paracetamol / Acetaminophen:** Used for mild-to-moderate pain and fever reduction.\n` +
-            `• **Amoxicillin / Antibiotics:** Must be completed for the full prescribed duration, even if symptoms improve early.\n\n` +
-            `⚠️ *Clinical Safety Reminder: Always follow the exact dosage and frequency prescribed by your consulting physician on your Hospito dashboard.*`;
-        } else if (q.includes('hi') || q.includes('hello') || q.includes('help') || q.includes('who are you')) {
-          fallbackReply = `Hello ${userName}! 👋 I'm your **Hospito AI Health & Platform Assistant**.\n\nI can help you with:\n` +
-            `• Understanding how to use your Patient Portal and track prescriptions\n` +
-            `• Explanations for common medications, dosage schedules, and health tips\n` +
-            `• Bilingual support in **English** and **Hindi (हिंदी)**\n\nFeel free to ask any question or tap one of the suggested prompts below!`;
-        } else {
-          fallbackReply = `Thank you for your question! 🌿\n\n` +
-            `On Hospito, your health records and digital prescriptions are seamlessly connected between your doctor and pharmacy.\n\n` +
-            `• **To check your medications:** Review the cards on your active dashboard.\n` +
-            `• **To contact your clinic:** Share your unique Patient ID with your doctor.\n\n` +
-            `Let me know if you need specific details about a medicine, dosage, or how the pharmacy workflow functions!`;
-        }
+      if (!sub) {
+        return res.status(404).json({ error: 'Subscription document not found in Atlas' });
       }
 
       res.json({
-        reply: fallbackReply,
-        language: isHindi ? 'hi' : 'en',
-        source: 'hospito-clinical-engine'
+        message: 'Subscription updated in Atlas',
+        subscription: sub,
       });
-    } catch (err) {
-      console.error('Chat endpoint error:', err);
-      res.status(500).json({ error: 'Failed to process chat query' });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
     }
   });
 
-  // --- VITE MIDDLEWARE SETUP ---
+  // ----------------------------------------------------
+  // VITE MIDDLEWARE & STATIC SERVING
+  // ----------------------------------------------------
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -502,10 +396,10 @@ Your core duties:
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Hospito Full-Stack server running at http://0.0.0.0:${PORT}`);
+    console.log(`🚀 SaaS Platform Server running on http://localhost:${PORT}`);
   });
 }
 
 startServer().catch((err) => {
-  console.error('Failed to start server:', err);
+  console.error('Fatal Server Startup Error:', err);
 });
